@@ -1,33 +1,85 @@
 from uuid import UUID
 from impacket.ldap.ldaptypes import LDAP_SID
-from soaphound.ad.cache_gen import pull_all_ad_objects, _parse_aces, filetime_to_unix, dedupe_aces, BH_TYPE_LABEL_MAP
-from soaphound.lib.utils import ADUtils, DNSCache
+from soaphound.ad.cache_gen import pull_all_ad_objects, _parse_aces, dedupe_aces, filetime_to_unix, BH_TYPE_LABEL_MAP
+from soaphound.lib.utils import ADUtils
 from soaphound.ad.adws import WELL_KNOWN_SIDS
-from .bh_rpc_computer import ADComputer
 import logging
-import queue
-import threading
-import json
-from soaphound.lib.computers import ComputerEnumerator
-from impacket.smbconnection import SMBConnection
-from impacket.dcerpc.v5 import tsts as TSTS
-import os
-import sys
 
-from soaphound.lib.authentication import ADAuthentication
-from soaphound.ad.acls import normalize_name
+def parse_spn_targets(spn_list, value_to_id_cache, id_to_type_cache):
+    """
+    Parse SPN list to create SPNTargets with ObjectIdentifier and ObjectType.
+    """
+    spn_targets = []
+    if not spn_list:
+        return spn_targets
+    
+    for spn in spn_list:
+        try:
+            parts = spn.split('/')
+            if len(parts) < 2:
+                continue
+            
+            hostname_part = parts[1].split(':')[0]
+            target_id = None
+            target_type = "Computer"
+            
+            for dn_upper in value_to_id_cache.keys():
+                if f"CN={hostname_part.upper()}," in dn_upper:
+                    target_id = value_to_id_cache[dn_upper]
+                    if target_id in id_to_type_cache:
+                        type_int = id_to_type_cache[target_id]
+                        type_map = {0: "User", 1: "Computer", 2: "Group"}
+                        target_type = type_map.get(type_int, "Computer")
+                    break
+            
+            if target_id:
+                spn_targets.append({
+                    "ObjectIdentifier": target_id,
+                    "ObjectType": target_type
+                })
+        except Exception as e:
+            logging.debug(f"Failed to parse SPN {spn}: {e}")
+            continue
+    
+    return spn_targets
 
-
-def get_output_dir_from_argv():
-    if "--output-dir" in sys.argv:
-        idx = sys.argv.index("--output-dir")
-        if idx + 1 < len(sys.argv):
-            return sys.argv[idx + 1]
-    return "output"
-
-output_dir = get_output_dir_from_argv()
-cache_file_path = os.path.join(output_dir, "Cache.json")
-
+def parse_allowed_to_delegate(delegate_list, value_to_id_cache, id_to_type_cache):
+    """
+    Parse msDS-AllowedToDelegateTo to create AllowedToDelegate list.
+    """
+    allowed_to_delegate = []
+    if not delegate_list:
+        return allowed_to_delegate
+    
+    for target_spn in delegate_list:
+        try:
+            parts = target_spn.split('/')
+            if len(parts) < 2:
+                continue
+            
+            hostname_part = parts[1].split(':')[0]
+            target_id = None
+            target_type = "Computer"
+            
+            for dn_upper in value_to_id_cache.keys():
+                if f"CN={hostname_part.upper()}," in dn_upper:
+                    target_id = value_to_id_cache[dn_upper]
+                    if target_id in id_to_type_cache:
+                        type_int = id_to_type_cache[target_id]
+                        type_map = {0: "User", 1: "Computer", 2: "Group"}
+                        target_type = type_map.get(type_int, "Computer")
+                    break
+            
+            if target_id:
+                allowed_to_delegate.append({
+                    "ObjectIdentifier": target_id,
+                    "ObjectType": target_type
+                })
+        except Exception as e:
+            logging.debug(f"Failed to parse delegation target {target_spn}: {e}")
+            continue
+    
+    return allowed_to_delegate
 
 def collect_computers_adws(
     ip=None,
@@ -36,18 +88,15 @@ def collect_computers_adws(
     auth=None,
     base_dn_override=None,
     cache_file=None,
-    adws_object_classes=None,has_laps=False,
-    has_lapsv2=False,
-    objecttype_guid_map=None
+    adws_object_classes=None,
+    has_laps=False,
+    has_lapsv2=False
 ):
     """
-        Collect all AD computers with ACLs, LAPS, without sessions or RPC.
+        Collect all AD computers via ADWS only (with ACLs, LAPS, without sessions or RPC).
     """
     import json
-    from uuid import UUID
-    from soaphound.lib.utils import ADUtils
 
-    # In case we have a cache file ready
     if cache_file:
         with open(cache_file, "r", encoding="utf-8") as f:
             cache_data = json.load(f)
@@ -64,42 +113,40 @@ def collect_computers_adws(
             o for o in objs
             if o.get("distinguishedName") and isinstance(o.get("distinguishedName"), str)
         ]
-        print(f"[INFO] Computers collected : {len(computers)}")
         return computers
 
-    # --- Attributes to collect ---
     attributes = [
         "name", "objectGUID", "objectSid", "objectClass", "distinguishedName",
         "nTSecurityDescriptor", "whenCreated", "description", "sAMAccountName", "dNSHostName", "userAccountControl",
-        "operatingSystem", "operatingSystemVersion", "servicePrincipalName", "msDS-AllowedToDelegateTo",
-        "lastLogon", "lastLogonTimestamp", "adminCount", "primaryGroupID"
+        "operatingSystem", "operatingSystemVersion", "servicePrincipalName",
+        "msDS-AllowedToActOnBehalfOfOtherIdentity", "msDS-AllowedToDelegateTo",
+        "lastLogon", "lastLogonTimestamp", "adminCount", "primaryGroupID", "sIDHistory"
     ]
-    
-    objecttype_guid_map_normalized = {k.lower(): v for k, v in (objecttype_guid_map or {}).items()}
-    
+    laps_attributes = [
+        "ms-Mcs-AdmPwd", "ms-Mcs-AdmPwdExpirationTime",
+        "msLAPS-EncryptedPassword", "msLAPS-PasswordExpirationTime",
+        "msLAPS-Password", "msLAPS-EncryptedPasswordHistory",
+        "msLAPS-EncryptedDSRMPassword", "msLAPS-EncryptedDSRMPasswordHistory"
+    ]
 
-    # Add msDS-AllowedToActOnBehalfOfOtherIdentity if available in schema
-    if "msds-allowedtoactonbehalfofotheridentity".lower() in objecttype_guid_map_normalized:        
-        attributes.append("msDS-AllowedToActOnBehalfOfOtherIdentity")
-    # Add LAPS v1 attributes if available
-    if has_laps:
-        if "ms-mcs-admpwdexpirationtime".lower() in objecttype_guid_map_normalized:
-            attributes.append("ms-Mcs-AdmPwdExpirationTime")
-        if "ms-mcs-admpwd".lower() in objecttype_guid_map_normalized:
-            attributes.append("ms-Mcs-AdmPwd")
-    # Add LAPS v2 attributes if available
+    lapsv2_attributes = [
+        "msLAPS-EncryptedPassword", "msLAPS-PasswordExpirationTime",
+    ]
+
+    if has_laps or has_lapsv2:
+        for laps_attr in laps_attributes:
+            if laps_attr not in attributes:
+                attributes.append(laps_attr)
     if has_lapsv2:
-        if "mslaps-passwordexpirationtime".lower() in objecttype_guid_map_normalized:
-            attributes.append("msLAPS-PasswordExpirationTime")
-        if "mslaps-encryptedpassword".lower() in objecttype_guid_map_normalized:
-            attributes.append("msLAPS-EncryptedPassword")
+        for laps_attr in lapsv2_attributes:
+            if laps_attr not in attributes:
+                attributes.append(laps_attr)
 
-    # Exclude GMSA/SMSA objects if present in schema
-    gmsa_filter = '(!(objectClass=msDS-GroupManagedServiceAccount))' if adws_object_classes and 'msDS-GroupManagedServiceAccount' in adws_object_classes else ''
-    smsa_filter = '(!(objectClass=msDS-ManagedServiceAccount))' if adws_object_classes and 'msDS-ManagedServiceAccount' in adws_object_classes else ''
+
+    gmsa_filter = '(!(objectClass=msDS-GroupManagedServiceAccount))' if 'msDS-GroupManagedServiceAccount' in (adws_object_classes or []) else ''
+    smsa_filter = '(!(objectClass=msDS-ManagedServiceAccount))' if 'msDS-ManagedServiceAccount' in (adws_object_classes or []) else ''
     query = f"(&(sAMAccountType=805306369){gmsa_filter}{smsa_filter})"
 
-    # --- Pull via ADWS ---
     raw_objects = pull_all_ad_objects(
         ip=ip,
         domain=domain,
@@ -110,45 +157,33 @@ def collect_computers_adws(
         base_dn_override=base_dn_override
     ).get("objects", [])
 
-    # --- BloodHound-style normalization ---
     for obj in raw_objects:
-        # objectClass
         oc = ADUtils.get_entry_property(obj, "objectClass", default=[])
         if isinstance(oc, str):
             obj["objectClass"] = [oc]
         elif oc is None:
             obj["objectClass"] = []
-        # DN en string
         dn = ADUtils.get_entry_property(obj, "distinguishedName", default="")
         if isinstance(dn, list):
             obj["distinguishedName"] = dn[0] if dn else ""
-        # GUID en string upper
         guid = ADUtils.get_entry_property(obj, "objectGUID")
         if isinstance(guid, bytes):
             try:
                 obj["objectGUID"] = str(UUID(bytes_le=guid)).upper()
             except Exception:
                 pass
-
-    print(f"[INFO] Computers collected : {len(raw_objects)}")
+    print(f"[INFO] Computers collected : {len(raw_objects)}")        
     return raw_objects
-
 
 def prefix_well_known_sid(sid: str, domain_name: str, domain_sid: str, well_known_sids=WELL_KNOWN_SIDS):
     sid = sid.upper()
     domain_sid = domain_sid.upper()
+    if not sid: return sid
     if sid.startswith(domain_sid + "-") or sid == domain_sid:
         return sid
     if sid in well_known_sids or sid.startswith("S-1-5-32-"):
         return f"{domain_name.upper()}-{sid}"
     return sid
-
-import queue
-
-
-
-
-
 
 def format_computers_adws(
     computers,
@@ -207,8 +242,7 @@ def format_computers_adws(
         sidhistory = obj.get("sIDHistory", [])
         if not isinstance(sidhistory, list): sidhistory = []
 
-    
-                # --- LAPS v1 and/or v2 detection ---
+        # LAPS Detection
         laps_signals = [
             "ms-Mcs-AdmPwd", "ms-Mcs-AdmPwdExpirationTime",
             "msLAPS-EncryptedPassword", "msLAPS-PasswordExpirationTime",
@@ -228,36 +262,6 @@ def format_computers_adws(
         aces_computer = dedupe_aces(aces_computer)
         for ace in aces_computer:
             ace["PrincipalSID"] = prefix_well_known_sid(ace["PrincipalSID"], domain, domain_sid)
-
-        allowed_to_act_list = []
-        act_raw = obj.get("msDS-AllowedToActOnBehalfOfOtherIdentity")
-        if act_raw:
-            try:
-                act_aces, _ = _parse_aces(
-                    act_raw,
-                    id_to_type_cache,
-                    comp_sid,
-                    "Computer",
-                    object_type_guid_map=objecttype_guid_map
-                )
-                act_aces = dedupe_aces(act_aces)
-                for a in act_aces:
-                    a["PrincipalSID"] = prefix_well_known_sid(a["PrincipalSID"], domain, domain_sid)
-                    right = a.get("RightName", "")
-                    # Follow BloodHound behavior: ignore Owner; only include meaningful rights (GenericAll is a clear signal)
-                    if right == "Owner":
-                        continue
-                    if right == "GenericAll" or right == "WriteDacl" or right == "WriteOwner" or right == "AddKeyCredentialLink" or right == "ReadLAPSPassword":
-                        allowed_to_act_list.append({
-                            "ObjectIdentifier": a["PrincipalSID"],
-                            "ObjectType": a.get("PrincipalType", "User")
-                        })
-            except Exception as e:
-                logging.debug("Failed to parse msDS-AllowedToActOnBehalfOfOtherIdentity for %s: %s", hostname, e)
-
-        # If no explicit RBCD entries were found, left as empty list (matching BloodHound default)
-
-
 
         props = {
             "name": hostname.upper() if hostname.upper().endswith(domain_upper) else f"{hostname.upper()}.{domain_upper}",
@@ -301,12 +305,19 @@ def format_computers_adws(
                     val = base64.b64encode(val).decode('ascii')
                 props[attr] = val
 
+        # Parse SPNs to create SPNTargets
+        spn_targets = parse_spn_targets(serviceprincipalnames, value_to_id_cache, id_to_type_cache)
+        
+        # Parse AllowedToDelegateTo for constrained delegation
+        allowed_to_delegate = parse_allowed_to_delegate(delegatehosts_raw, value_to_id_cache, id_to_type_cache)
+
         computer_bh_entry = {
             "ObjectIdentifier": comp_sid,
-            "AllowedToAct": allowed_to_act_list,
+            "AllowedToAct": [],
             "PrimaryGroupSID": f"{domain_sid}-{obj.get('primaryGroupID', 515)}",
             "Properties": props,
             "Aces": aces_computer,
+            "SPNTargets": spn_targets,
             "Sessions": {
                 "Collected": False,
                 "FailureReason": "ADWS-only mode: not collected",
@@ -324,7 +335,7 @@ def format_computers_adws(
             },
             "LocalGroups": [],
             "UserRights": [],
-            "AllowedToDelegate": [],
+            "AllowedToDelegate": allowed_to_delegate,
             "HasSIDHistory": [],
             "IsDeleted": False,
             "Status": None,
@@ -342,4 +353,3 @@ def format_computers_adws(
             "version": 6
         }
     }
-

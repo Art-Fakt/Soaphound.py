@@ -1,102 +1,183 @@
 from uuid import UUID
 import logging
 from impacket.ldap.ldaptypes import LDAP_SID
-from soaphound.ad.cache_gen import pull_all_ad_objects, _parse_aces, dedupe_aces, filetime_to_unix, adws_objecttype_guid_map
+from soaphound.ad.cache_gen import pull_all_ad_objects, _ldap_datetime_to_epoch, _parse_aces, dedupe_aces, filetime_to_unix, adws_objecttype_guid_map
 from soaphound.ad.adws import WELL_KNOWN_SIDS
 from soaphound.lib.utils import ADUtils
 
-
-
-def collect_users(
-    ip=None,
-    domain=None,
-    username=None,
-    auth=None,
-    base_dn_override=None,
-    adws_object_classes=None,
-    adws_objecttype_guid_map=None,
-    include_properties=True,
-    acl=True
-):
+def parse_spn_targets(spn_list, value_to_id_cache, id_to_type_cache):
     """
-    Collect all user objects (regular, GMSA, SMSA) in a granular way, like BloodHound.py.
-    `adws_object_classes` must be the list of objectClass from the schema.
-    `adws_objecttype_guid_map` must be the mapping of attributes in the schema (lDAPDisplayName: GUID).
+    Parse SPN list to create SPNTargets with ObjectIdentifier and ObjectType.
+    SPN format: service/hostname[:port][/servicename]
     """
-    # BH base properties
-    properties = [
-        "sAMAccountName", "distinguishedName", "sAMAccountType",
-        "objectSid", "primaryGroupID", "isDeleted", "objectClass"
+    spn_targets = []
+    if not spn_list:
+        return spn_targets
+    
+    for spn in spn_list:
+        try:
+            parts = spn.split('/')
+            if len(parts) < 2:
+                continue
+            
+            # Extract hostname from SPN
+            hostname_part = parts[1].split(':')[0]  # Remove port if present
+            
+            # Try to find the computer in cache by hostname
+            # Look for the DN pattern with CN=hostname
+            target_id = None
+            target_type = "Computer"
+            
+            # Try variations of hostname lookups
+            for dn_upper in value_to_id_cache.keys():
+                if f"CN={hostname_part.upper()}," in dn_upper:
+                    target_id = value_to_id_cache[dn_upper]
+                    if target_id in id_to_type_cache:
+                        type_int = id_to_type_cache[target_id]
+                        type_map = {0: "User", 1: "Computer", 2: "Group"}
+                        target_type = type_map.get(type_int, "Computer")
+                    break
+            
+            if target_id:
+                spn_targets.append({
+                    "ObjectIdentifier": target_id,
+                    "ObjectType": target_type
+                })
+        except Exception as e:
+            logging.debug(f"Failed to parse SPN {spn}: {e}")
+            continue
+    
+    return spn_targets
+
+def parse_allowed_to_delegate(delegate_list, value_to_id_cache, id_to_type_cache):
+    """
+    Parse msDS-AllowedToDelegateTo to create AllowedToDelegate list.
+    Format: service/hostname[:port]
+    """
+    allowed_to_delegate = []
+    if not delegate_list:
+        return allowed_to_delegate
+    
+    for target_spn in delegate_list:
+        try:
+            # Extract hostname from SPN
+            parts = target_spn.split('/')
+            if len(parts) < 2:
+                continue
+            
+            hostname_part = parts[1].split(':')[0]  # Remove port if present
+            
+            # Try to find the computer in cache
+            target_id = None
+            target_type = "Computer"
+            
+            for dn_upper in value_to_id_cache.keys():
+                if f"CN={hostname_part.upper()}," in dn_upper:
+                    target_id = value_to_id_cache[dn_upper]
+                    if target_id in id_to_type_cache:
+                        type_int = id_to_type_cache[target_id]
+                        type_map = {0: "User", 1: "Computer", 2: "Group"}
+                        target_type = type_map.get(type_int, "Computer")
+                    break
+            
+            if target_id:
+                allowed_to_delegate.append({
+                    "ObjectIdentifier": target_id,
+                    "ObjectType": target_type
+                })
+        except Exception as e:
+            logging.debug(f"Failed to parse delegation target {target_spn}: {e}")
+            continue
+    
+    return allowed_to_delegate
+
+def collect_users(ip=None, domain=None, username=None, auth=None, base_dn_override=None, adws_object_classes=None):
+    """
+    Collecte tous les objets utilisateurs (classiques, GMSA et SMSA selon support)
+    """
+    attributes = [
+        "name", "objectGUID", "objectSid", "objectClass", "distinguishedName", "userAccountControl",
+        "whenCreated", "description", "memberOf", "primaryGroupID", "sAMAccountName", "displayName", "mail",
+        "title", "adminCount", "lastLogon", "lastLogonTimestamp", "pwdLastSet", "msDS-AllowedToDelegateTo",
+        "servicePrincipalName", "sIDHistory", "whenChanged", "nTSecurityDescriptor",
+        # Additional attributes for enhanced BloodHound analysis
+        "userPassword", "homeDirectory", "logonScript", "profilePath", "scriptPath",
+        "msDS-UserPasswordExpiryTimeComputed", "msDS-SupportedEncryptionTypes",
+        "unicodePwd", "unixUserPassword", "msSFU30Password", "accountExpires"
     ]
-    # msDS-GroupMSAMembership if attribute is present (mapping of attributes, not classes)
-    if adws_objecttype_guid_map and "msds-groupmsamembership".lower() in adws_objecttype_guid_map:
-        properties.append("msDS-GroupMSAMembership")
-    # Additional properties if requested
-    if include_properties:
-        properties += [
-            "servicePrincipalName", "userAccountControl", "displayName",
-            "lastLogon", "lastLogonTimestamp", "pwdLastSet", "mail", "title", "homeDirectory",
-            "description", "userPassword", "adminCount", "msDS-AllowedToDelegateTo", "sIDHistory",
-            "whencreated", "unicodepwd", "scriptpath"
-        ]
-        if adws_objecttype_guid_map and "unixuserpassword" in adws_objecttype_guid_map:
-            properties.append("unixuserpassword")
-    if acl:
-        properties.append("nTSecurityDescriptor")
+    
+    users = []
 
-    # Build objectClass filters exactly like BH
-    # GMSA
-    if adws_object_classes and "msDS-GroupManagedServiceAccount" in adws_object_classes:
-        gmsa_filter = "(objectClass=msDS-GroupManagedServiceAccount)"
-    else:
-        logging.debug("No support for GMSA, skipping in query")
-        gmsa_filter = ""
-    # SMSA
-    if adws_object_classes and "msDS-ManagedServiceAccount" in adws_object_classes:
-        smsa_filter = "(objectClass=msDS-ManagedServiceAccount)"
-    else:
-        logging.debug("No support for SMSA, skipping in query")
-        smsa_filter = ""
-
-    # Combine all user object types in a single query (exactly like BloodHound.py)
-    if gmsa_filter or smsa_filter:
-        query = f"(|(&(objectCategory=person)(objectClass=user)){gmsa_filter}{smsa_filter})"
-    else:
-        query = "(&(objectCategory=person)(objectClass=user))"
-
-    # Retrieve the objects
-    users = pull_all_ad_objects(
+    # Classic users
+    query_users = "(&(objectCategory=person)(objectClass=user))"
+    users += pull_all_ad_objects(
         ip=ip,
         domain=domain,
         username=username,
         auth=auth,
-        query=query,
-        attributes=properties,
+        query=query_users,
+        attributes=attributes,
         base_dn_override=base_dn_override
     ).get("objects", [])
 
-    # Normalization as in BloodHound.py
+    #print("object_class" + str(adws_object_classes))
+    # GMSA if supported and present in LDAP schema
+    if adws_object_classes and "msDS-GroupManagedServiceAccount" in adws_object_classes:
+        query_gmsa = "(objectClass=msDS-GroupManagedServiceAccount)"
+        users += pull_all_ad_objects(
+            ip=ip,
+            domain=domain,
+            username=username,
+            auth=auth,
+            query=query_gmsa,
+            attributes=attributes + ["msDS-GroupMSAMembership"],
+            base_dn_override=base_dn_override
+        ).get("objects", [])
+    else:
+        logging.debug("No support for GMSA, skipping GMSA query")
+        
+    # SMSA if supported and present in schema
+    if adws_object_classes and "msDS-ManagedServiceAccount" in adws_object_classes:
+        query_smsa = "(objectClass=msDS-ManagedServiceAccount)"
+        users += pull_all_ad_objects(
+            ip=ip,
+            domain=domain,
+            username=username,
+            auth=auth,
+            query=query_smsa,
+            attributes=attributes,
+            base_dn_override=base_dn_override
+        ).get("objects", [])
+    else:
+        logging.debug("No support for SMSA, skipping SMSA query")
+    
+     # Normalization as in BloodHound.py
+
     for obj in users:
-        # objectClass always a list
+
+        # Check if objectClass is a string, convert it to a list
         oc = ADUtils.get_entry_property(obj, "objectClass", default=[])
         if isinstance(oc, str):
             obj["objectClass"] = [oc]
         elif oc is None:
             obj["objectClass"] = []
-        # DN always a string
+        # DN as a simple string
         dn = ADUtils.get_entry_property(obj, "distinguishedName", default="")
         if isinstance(dn, list):
             obj["distinguishedName"] = dn[0] if dn else ""
-        # GUID as string
+        # ID as upper-case GUID if objectGUID is present and of type bytes
+
         guid = ADUtils.get_entry_property(obj, "objectGUID")
         if isinstance(guid, bytes):
             try:
+                from uuid import UUID
                 obj["objectGUID"] = str(UUID(bytes_le=guid)).upper()
             except Exception:
                 pass
-
     print(f"[INFO] Users collected : {len(users)}")
     return users
+
+
 
 
 def prefix_well_known_sid(sid: str, domain_name: str, domain_sid: str, well_known_sids=WELL_KNOWN_SIDS):
@@ -185,14 +266,25 @@ def format_users(
         title = _get(obj, "title")
         homedirectory = _get(obj, "homeDirectory")
         logonscript = _get(obj, "logonScript")
+        scriptpath = _get(obj, "scriptPath")
+        profilepath = _get(obj, "profilePath")
         userpassword = _get(obj, "userPassword")
         unicodepassword = _get(obj, "unicodePwd")
         unixpassword = _get(obj, "unixUserPassword")
-        sfupassword = _get(obj, "sFUPassword")
+        sfupassword = _get(obj, "msSFU30Password")
+        accountexpires = filetime_to_unix(obj.get("accountExpires"))
+        msdsuserpasswordexpiry = filetime_to_unix(obj.get("msDS-UserPasswordExpiryTimeComputed"))
+        supportedencryptiontypes = _get(obj, "msDS-SupportedEncryptionTypes")
         sidhistory = obj.get("sIDHistory", [])
         if not isinstance(sidhistory, list): sidhistory = []
         serviceprincipalnames = obj.get("servicePrincipalName", [])
         if not isinstance(serviceprincipalnames, list): serviceprincipalnames = []
+        
+        # Parse msDS-AllowedToDelegateTo for constrained delegation
+        delegate_to = obj.get("msDS-AllowedToDelegateTo", [])
+        if not isinstance(delegate_to, list):
+            delegate_to = [delegate_to] if delegate_to else []
+        
         isaclprotected = False  # Default value, updated if ACL is processed
 
         # ACEs on the user
@@ -245,9 +337,14 @@ def format_users(
             "unixpassword": unixpassword if unixpassword else None,
             "unicodepassword": unicodepassword if unicodepassword else None,
             "logonscript": logonscript if logonscript else None,
+            "scriptpath": scriptpath if scriptpath else None,
+            "profilepath": profilepath if profilepath else None,
             "samaccountname": sAM,
             "sfupassword": sfupassword if sfupassword else None,
             "isaclprotected": isaclprotected,
+            "accountexpires": accountexpires if accountexpires and accountexpires > 0 else None,
+            "msdsuserpasswordexpiry": msdsuserpasswordexpiry if msdsuserpasswordexpiry and msdsuserpasswordexpiry > 0 else None,
+            "supportedencryptiontypes": supportedencryptiontypes if supportedencryptiontypes else None,
         }
 
         # PRIMARY GROUP
@@ -259,14 +356,20 @@ def format_users(
         else:
             primary_sid = None
 
+        # Parse SPNs to create SPNTargets
+        spn_targets = parse_spn_targets(serviceprincipalnames, value_to_id_cache, id_to_type_cache)
+        
+        # Parse AllowedToDelegateTo for constrained delegation
+        allowed_to_delegate = parse_allowed_to_delegate(delegate_to, value_to_id_cache, id_to_type_cache)
+
         user_bh_entry = {
-            "AllowedToDelegate": [],        # Can be completed like in BH if needed
+            "AllowedToDelegate": allowed_to_delegate,
             "ObjectIdentifier": user_sid,
             "PrimaryGroupSID": primary_sid,
             "ContainedBy": None,
             "Properties": props,
             "Aces": aces_user,
-            "SPNTargets": [],
+            "SPNTargets": spn_targets,
             "HasSIDHistory": [],
             "IsDeleted": False,
             "IsACLProtected": isaclprotected,

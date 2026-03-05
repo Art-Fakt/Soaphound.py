@@ -118,8 +118,7 @@ class ADUtils(object):
         4: "2008 R2",
         5: "2012",
         6: "2012 R2",
-        7: "2016",
-        10: "2025" 
+        7: "2016"
     }
 
     xml_sid_rex = re.compile('<UserId>(S-[0-9\\-]+)</UserId>')
@@ -167,83 +166,6 @@ class ADUtils(object):
             pass
 
         return result
-
-    @staticmethod
-    def find_main_domain_sid(all_collected_items, main_domain_root_dn):
-        # Backward-compatible lookup for main domain SID.
-        # Accepts either:
-        # - main_domain_root_dn as a dict containing "objectSid" (old behaviour)
-        # - main_domain_root_dn as a DN string to match against all_collected_items (new behaviour)
-        # If not found, return empty string (caller expects a fallback).
-        # Normalize all_collected_items to a list if needed.
-        # Handle objectClass being a string or list.
-
-        # If main_domain_root_dn is already an object/dict with objectSid, use it directly
-        if isinstance(main_domain_root_dn, dict):
-            sid_bytes = main_domain_root_dn.get("objectSid")
-            if isinstance(sid_bytes, bytes):
-                return LDAP_SID(sid_bytes).formatCanonical()
-            elif isinstance(sid_bytes, str) and sid_bytes.upper().startswith("S-1-"):
-                return sid_bytes.upper()
-
-        # Prepare items list
-        items = all_collected_items or []
-        if isinstance(items, dict):
-            # sometimes a cache/dict of objects is passed; convert to values
-            items = list(items.values())
-
-        # If main domain DN is a string, use it to find the matching object
-        main_dn_norm = None
-        if isinstance(main_domain_root_dn, str) and main_domain_root_dn:
-            main_dn_norm = main_domain_root_dn.lower()
-
-        if main_dn_norm:
-            for obj in items:
-                dn = obj.get("distinguishedName", "")
-                obj_class = obj.get("objectClass", [])
-                if isinstance(obj_class, str):
-                    obj_class = [obj_class]
-                if (
-                    dn and dn.lower() == main_dn_norm
-                    and ("objectSid" in obj)
-                    and (("domainDNS" in obj_class or "domain" in obj_class) or not obj_class)
-                ):
-                    sid_bytes = obj["objectSid"]
-                    if isinstance(sid_bytes, bytes):
-                        return LDAP_SID(sid_bytes).formatCanonical()
-                    elif isinstance(sid_bytes, str) and sid_bytes.upper().startswith("S-1-"):
-                        return sid_bytes.upper()
-
-        # Fallback: first object of type domainDNS with a SID
-        for obj in items:
-            obj_class = obj.get("objectClass", [])
-            if isinstance(obj_class, str):
-                obj_class = [obj_class]
-            if ("domainDNS" in obj_class or "domain" in obj_class) and "objectSid" in obj:
-                sid_bytes = obj["objectSid"]
-                if isinstance(sid_bytes, bytes):
-                    return LDAP_SID(sid_bytes).formatCanonical()
-                elif isinstance(sid_bytes, str) and sid_bytes.upper().startswith("S-1-"):
-                    return sid_bytes.upper()
-
-        # If not found, return empty string instead of raising
-        return ""
-
-        # Fallback: first object of type domainDNS with a SID
-        for obj in items:
-            obj_class = obj.get("objectClass", [])
-            if isinstance(obj_class, str):
-                obj_class = [obj_class]
-            if ("domainDNS" in obj_class or "domain" in obj_class) and "objectSid" in obj:
-                sid_bytes = obj["objectSid"]
-                if isinstance(sid_bytes, bytes):
-                    return LDAP_SID(sid_bytes).formatCanonical()
-                elif isinstance(sid_bytes, str) and sid_bytes.upper().startswith("S-1-"):
-                    return sid_bytes.upper()
-
-        # If not found, return empty string instead of raising
-        return ""
-
 
     @staticmethod
     def rpc_get_hostname(ip, adauth):
